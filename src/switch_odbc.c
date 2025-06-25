@@ -1,4 +1,4 @@
-/*
+﻿/*
  * FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
  * Copyright (C) 2005-2014, Anthony Minessale II <anthm@freeswitch.org>
  *
@@ -46,7 +46,6 @@
 #if (ODBCVER < 0x0300)
 #define SQL_NO_DATA SQL_SUCCESS
 #endif
-
 struct switch_odbc_handle {
 	char *dsn;
 	char *username;
@@ -453,6 +452,93 @@ SWITCH_DECLARE(switch_odbc_status_t) switch_odbc_handle_exec_string(switch_odbc_
 #endif
 }
 
+
+
+static char *apply_dynamic_rule(const char *input, const char *pattern, const char *templ)
+{
+	size_t len = strlen(input);
+	size_t cap = len * 2 + 1;
+	char *curr = NULL, *next = NULL;
+	switch_malloc(curr, cap);
+	switch_malloc(next, cap);
+	memcpy(curr, input, len + 1);
+
+	switch_regex_t *re = NULL;
+	int ovector[30], cnt;
+
+	// Attempt first match
+	cnt = switch_regex_perform(curr, pattern, &re, ovector, 30);
+	if (cnt <= 0) {
+		switch_safe_free(re);
+		switch_safe_free(next);
+		return curr; // no replacements, return original buffer
+	}
+
+	// Loop to replace all occurrences
+	do {
+		switch_perform_substitution(re, cnt, templ, curr, next, cap, ovector);
+		switch_safe_free(re);
+		re = NULL;
+		// swap buffers for next iteration
+		char *tmp = curr;
+		curr = next;
+		next = tmp;
+		cnt = switch_regex_perform(curr, pattern, &re, ovector, 30);
+	} while (cnt > 0);
+
+	// cleanup unused buffer
+	switch_safe_free(next);
+	return curr;
+}
+
+static char *replace_all_bigint_dyn(const char *input)
+{
+	const char *pattern = "/(.*?)\\bBIGINT\\b(.*)/si"; // word-boundary, case-insensitive + dotall
+	const char *templ = "$1NUMBER(19)$2";
+	return apply_dynamic_rule(input, pattern, templ);
+}
+
+static char *replace_all_long_varchar_dyn(const char *input)
+{
+	const char *pattern =
+		"/(.*?)\\bVARCHAR\\(\\s*(?:400[1-9]|40[1-9]\\d|4[1-9]\\d{2}|[5-9]\\d{3}|\\d{5,})\\s*\\)(.*)/si";
+	const char *templ = "$1VARCHAR(4000)$2";
+	return apply_dynamic_rule(input, pattern, templ);
+}
+
+static char *replace_all_text_dyn(const char *input)
+{
+	const char *pattern = "/(.*?)\\bTEXT\\b(.*)/si"; // word-boundary, case-insensitive + dotall
+	const char *templ = "$1CLOB$2";
+	return apply_dynamic_rule(input, pattern, templ);
+}
+
+static char *replace_all_not_null_default_dyn(const char *input)
+{
+	const char *pattern = "/(.*?)\\bNOT\\s+NULL\\s+DEFAULT\\b\\s+([^,]+)(.*)/si";
+	const char *templ = "$1DEFAULT $2 NOT NULL$3";
+	return apply_dynamic_rule(input, pattern, templ);
+}
+
+static char *transform_all_dyn(const char *input)
+{
+	char *step = replace_all_bigint_dyn(input);
+	if (!step) return NULL;
+	char *tmp = replace_all_long_varchar_dyn(step);
+	switch_safe_free(step);
+	if (!tmp) return NULL;
+
+	step = replace_all_text_dyn(tmp);
+	switch_safe_free(tmp);
+	if (!step) return NULL;
+
+	tmp = replace_all_not_null_default_dyn(step);
+	switch_safe_free(step);
+	return tmp;
+}
+
+
+
 SWITCH_DECLARE(switch_odbc_status_t) switch_odbc_handle_exec(switch_odbc_handle_t *handle, const char *sql, switch_odbc_statement_handle_t *rstmt,
 															 char **err)
 {
@@ -461,10 +547,20 @@ SWITCH_DECLARE(switch_odbc_status_t) switch_odbc_handle_exec(switch_odbc_handle_
 	int result;
 	char *err_str = NULL, *err2 = NULL;
 	SQLLEN m = 0;
+	char *out = NULL;
 
 	handle->affected_rows = 0;
 
 	if (!db_is_up(handle)) {
+		goto error;
+	}
+	
+	//switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "Requesting sql: [%s]\n", sql);
+	out = transform_all_dyn(sql);
+	if (out) {
+		//switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "Changed sql: [%s]\n", out);
+	} else {
+		err2 = "Cannot transform sql code";
 		goto error;
 	}
 
@@ -473,7 +569,7 @@ SWITCH_DECLARE(switch_odbc_status_t) switch_odbc_handle_exec(switch_odbc_handle_
 		goto error;
 	}
 
-	if (SQLPrepare(stmt, (unsigned char *) sql, SQL_NTS) != SQL_SUCCESS) {
+	if (SQLPrepare(stmt, (unsigned char *) out, SQL_NTS) != SQL_SUCCESS) {
 		err2 = "SQLPrepare failed.";
 		goto error;
 	}
@@ -506,12 +602,12 @@ SWITCH_DECLARE(switch_odbc_status_t) switch_odbc_handle_exec(switch_odbc_handle_
 	} else {
 		SQLFreeHandle(SQL_HANDLE_STMT, stmt);
 	}
-
+	switch_safe_free(out);
 	return SWITCH_ODBC_SUCCESS;
 
   error:
 
-
+	switch_safe_free(out);
 	if (stmt) {
 		err_str = switch_odbc_handle_get_error(handle, stmt);
 	}
@@ -525,8 +621,8 @@ SWITCH_DECLARE(switch_odbc_status_t) switch_odbc_handle_exec(switch_odbc_handle_
 	}
 
 	if (err_str) {
-		if (!switch_stristr("already exists", err_str) && !switch_stristr("duplicate key name", err_str)) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ERR: [%s]\n[%s]\n", sql, switch_str_nil(err_str));
+		if (!switch_stristr("already exists", err_str) && !switch_stristr("duplicate key name", err_str) && !switch_stristr("name is already used", err_str)) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ERR: [%s]\n[%s]\n", out, switch_str_nil(err_str));
 		}
 		if (err) {
 			*err = err_str;
