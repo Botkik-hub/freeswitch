@@ -64,7 +64,7 @@ static int system_ready = 0;
 
 #ifdef WIN32
 /* If we are a windows service, what should we be called */
-#define SERVICENAME_DEFAULT "FreeSWITCH"
+#define SERVICENAME_DEFAULT "AlkcomPBX"
 #define SERVICENAME_MAXLEN 256
 static char service_name[SERVICENAME_MAXLEN];
 static switch_core_flag_t service_flags = SCF_NONE;
@@ -175,7 +175,7 @@ void WINAPI ServiceCtrlHandler(DWORD control)
 		switch_core_destroy();
 		/* set service status values */
 		status.dwCurrentState = SERVICE_STOPPED;
-		status.dwWin32ExitCode = 0;
+		status.dwWin32ExitCode = 1;
 		status.dwCheckPoint = 0;
 		status.dwWaitHint = 0;
 		break;
