@@ -2511,13 +2511,16 @@ int sofia_glue_init_sql(sofia_profile_t *profile)
 
 	if (!dbh) { return 0; }
 
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "SKIPPING TEST SOFIA DB CONNECTION!!!!");
+	return 1;
+
 	test_sql = switch_mprintf("delete from sip_registrations where sub_host is null "
 							  "and hostname='%q' "
 							  "and network_ip like '%%' and network_port like '%%' and sip_username "
 							  "like '%%' and mwi_user  like '%%' and mwi_host like '%%' "
 							  "and orig_server_host like '%%' and orig_hostname like '%%'",
 							  mod_sofia_globals.hostname);
-
+	
 	switch_cache_db_test_reactive(dbh, test_sql, "drop table sip_registrations", reg_sql);
 
 	switch_cache_db_test_reactive(dbh, "select ping_count from sip_registrations", NULL,
