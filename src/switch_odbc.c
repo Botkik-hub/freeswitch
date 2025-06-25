@@ -520,6 +520,68 @@ static char *replace_all_not_null_default_dyn(const char *input)
 	return apply_dynamic_rule(input, pattern, templ);
 }
 
+static char *split_long_string_dyn(const char *input)
+{
+	size_t len = strlen(input);
+	size_t cap = len * 3 + 1;
+	char *out = NULL;
+	switch_malloc(out, cap);
+	size_t pos = 0;
+	const char *p = input;
+
+	while (*p) {
+		if (*p == '\'') {
+			p++; // skip literal start
+			const char *start = p;
+			while (*p) {
+				if (*p == '\'') {
+					if (*(p + 1) == '\'') {
+						p += 2; // escaped quote
+						continue;
+					}
+					break;
+				}
+				p++;
+			}
+			size_t lit_len = p - start;
+			if (lit_len <= 4000) {
+				out[pos++] = '\'';
+				memcpy(out + pos, start, lit_len);
+				pos += lit_len;
+				if (*p == '\'') {
+					out[pos++] = '\'';
+					p++;
+				}
+			} else {
+				size_t off = 0;
+				int first = 1;
+				while (off < lit_len) {
+					size_t seg = lit_len - off;
+					if (seg > 4000) seg = 4000;
+					if (!first) {
+						memcpy(out + pos, " || ", 4);
+						pos += 4;
+					}
+					first = 0;
+					memcpy(out + pos, "to_clob('", 9);
+					pos += 9;
+					memcpy(out + pos, start + off, seg);
+					pos += seg;
+					memcpy(out + pos, "')", 2);
+					pos += 2;
+					off += seg;
+				}
+				if (*p == '\'') p++;
+			}
+		} else {
+			out[pos++] = *p++;
+		}
+	}
+	out[pos] = '\0';
+	return out;
+}
+
+
 static char *transform_all_dyn(const char *input)
 {
 	char *step = replace_all_bigint_dyn(input);
@@ -534,9 +596,13 @@ static char *transform_all_dyn(const char *input)
 
 	tmp = replace_all_not_null_default_dyn(step);
 	switch_safe_free(step);
-	return tmp;
-}
+	if (!tmp) return NULL;
 
+	// Final: split long string literals
+	char *final = split_long_string_dyn(tmp);
+	switch_safe_free(tmp);
+	return final;
+}
 
 
 SWITCH_DECLARE(switch_odbc_status_t) switch_odbc_handle_exec(switch_odbc_handle_t *handle, const char *sql, switch_odbc_statement_handle_t *rstmt,
@@ -621,8 +687,8 @@ SWITCH_DECLARE(switch_odbc_status_t) switch_odbc_handle_exec(switch_odbc_handle_
 	}
 
 	if (err_str) {
-		if (!switch_stristr("already exists", err_str) && !switch_stristr("duplicate key name", err_str) && !switch_stristr("name is already used", err_str)) {
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ERR: [%s]\n[%s]\n", out, switch_str_nil(err_str));
+		if (!switch_stristr("already exists", err_str) && !switch_stristr("duplicate key name", err_str) && !switch_stristr("STATE: HY000 CODE 955", err_str)) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ERR: [%s]\n[%s]\n", out ? out : sql, switch_str_nil(err_str));
 		}
 		if (err) {
 			*err = err_str;
