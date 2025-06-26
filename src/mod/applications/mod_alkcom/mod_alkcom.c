@@ -32,6 +32,57 @@
  */
 #include <switch.h>
 
+
+#ifdef WIN32
+#include <windows.h>
+BOOL EnableShutdownPrivilege()
+{
+	HANDLE hToken;
+	TOKEN_PRIVILEGES tkp;
+
+	// Open the process token
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "ALKCOM: OpenProcessToken\n");
+		return FALSE;
+	}
+
+	// Get the LUID for shutdown privilege
+	LookupPrivilegeValue(NULL, SE_SHUTDOWN_NAME, &tkp.Privileges[0].Luid);
+
+	tkp.PrivilegeCount = 1; // one privilege to set
+	tkp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+	// Adjust the token privilege
+	if (!AdjustTokenPrivileges(hToken, FALSE, &tkp, 0, NULL, NULL)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "ALKCOM: AdjustTokenPrivileges\n");
+		CloseHandle(hToken);
+		return FALSE;
+	}
+
+	CloseHandle(hToken);
+	return TRUE;
+}
+#endif
+
+static switch_bool_t reboot() {
+#ifdef WIN32
+	if (!EnableShutdownPrivilege()) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "ALKCOM: Failed to get shutdown privilege\n");
+		return SWITCH_FALSE;
+	}
+
+	// Initiate reboot
+	if (!ExitWindowsEx(EWX_REBOOT | EWX_FORCE, SHTDN_REASON_MAJOR_SOFTWARE | SHTDN_REASON_FLAG_PLANNED)) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM: ExitWindowsEx\n");
+		return SWITCH_TRUE;
+	}
+	return SWITCH_FALSE;
+#else // WIN32
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "ALKCOM: WIN32 not declared!\n");
+	return SWITCH_FALSE;
+#endif // WIN32
+}
+
 /* Prototypes */
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_alkcom_shutdown);
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_alkcom_runtime);
@@ -40,207 +91,121 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_alkcom_load);
 /* SWITCH_MODULE_DEFINITION(name, load, shutdown, runtime)
  * Defines a switch_loadable_module_function_table_t and a static const char[] modname
  */
-SWITCH_MODULE_DEFINITION(mod_alkcom, mod_alkcom_load, mod_alkcom_shutdown, NULL);
+SWITCH_MODULE_DEFINITION(mod_alkcom, mod_alkcom_load, mod_alkcom_shutdown, mod_alkcom_runtime);
 
-typedef enum {
-	CODEC_NEGOTIATION_GREEDY = 1,
-	CODEC_NEGOTIATION_GENEROUS = 2,
-	CODEC_NEGOTIATION_EVIL = 3
-} codec_negotiation_t;
+typedef enum { 
+	STATE_UNKNOWN = 0,
+	STATE_PRIMARY = 1,
+	STATE_SECONDARY = 2
+} switchover_state_t;
 
 static struct {
-	char *codec_negotiation_str;
-	codec_negotiation_t codec_negotiation;
-	switch_bool_t sip_trace;
-	int integer;
+	char *floating_ip_addr;
+	switchover_state_t state;
+	switch_bool_t do_reboot;
+	switch_bool_t is_running;
+	switch_bool_t is_available;
 } globals;
 
-static switch_status_t config_callback_siptrace(switch_xml_config_item_t *data, switch_config_callback_type_t callback_type, switch_bool_t changed)
-{
-	switch_bool_t value = *(switch_bool_t *) data->ptr;
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "In siptrace callback: value %s changed %s\n",
-					  value ? "true" : "false", changed ? "true" : "false");
 
+static switch_xml_config_string_options_t limit_config_ip = {NULL, 0,
+	"^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$"}; // ip address regex
 
-	/*
-	   if ((callback_type == CONFIG_LOG || callback_type == CONFIG_RELOAD) && changed) {
-	   nua_set_params(((sofia_profile_t*)data->functiondata)->nua, TPTAG_LOG(value), TAG_END());
-	   }
-	 */
-
-	return SWITCH_STATUS_SUCCESS;
-}
-
-static switch_xml_config_string_options_t config_opt_codec_negotiation = { NULL, 0, "greedy|generous|evil" };
-
-/* enforce_min, min, enforce_max, max */
-static switch_xml_config_int_options_t config_opt_integer = { SWITCH_TRUE, 0, SWITCH_TRUE, 10 };
-static switch_xml_config_enum_item_t config_opt_codec_negotiation_enum[] = {
-	{"greedy", CODEC_NEGOTIATION_GREEDY},
-	{"generous", CODEC_NEGOTIATION_GENEROUS},
-	{"evil", CODEC_NEGOTIATION_EVIL},
-	{NULL, 0}
-};
 
 static switch_xml_config_item_t instructions[] = {
-	/* parameter name        type                 reloadable   pointer                         default value     options structure */
-	SWITCH_CONFIG_ITEM("codec-negotiation-str", SWITCH_CONFIG_STRING, CONFIG_RELOADABLE, &globals.codec_negotiation_str, "greedy",
-					   &config_opt_codec_negotiation,
-					   "greedy|generous|evil", "Specifies the codec negotiation scheme to be used."),
-	SWITCH_CONFIG_ITEM("codec-negotiation", SWITCH_CONFIG_ENUM, CONFIG_RELOADABLE, &globals.codec_negotiation, (void *) CODEC_NEGOTIATION_GREEDY,
-					   &config_opt_codec_negotiation_enum,
-					   "greedy|generous|evil", "Specifies the codec negotiation scheme to be used."),
-	SWITCH_CONFIG_ITEM_CALLBACK("sip-trace", SWITCH_CONFIG_BOOL, CONFIG_RELOADABLE, &globals.sip_trace, (void *) SWITCH_FALSE,
-								(switch_xml_config_callback_t) config_callback_siptrace, NULL,
-								"yes|no", "If enabled, print out sip messages on the console."),
-	SWITCH_CONFIG_ITEM("integer", SWITCH_CONFIG_INT, CONFIG_RELOADABLE, &globals.integer, (void *) 100, &config_opt_integer,
-					   NULL, NULL),
+	/*					parameter name        type                 reloadable   pointer						default value     options structure */
+	SWITCH_CONFIG_ITEM("floating-ip", SWITCH_CONFIG_STRING, CONFIG_RELOADABLE, &globals.floating_ip_addr, "0.0.0.0",
+					   &limit_config_ip,
+					   "ip v4 address", "Specify floating ip address to check."),
+	SWITCH_CONFIG_ITEM("reboot", SWITCH_CONFIG_BOOL, CONFIG_RELOADABLE, &globals.do_reboot, (void *)SWITCH_FALSE,
+						NULL, "yes|no", "If enabled, print out sip messages on the console."),
 	SWITCH_CONFIG_ITEM_END()
 };
 
 static switch_status_t do_config(switch_bool_t reload)
 {
 	memset(&globals, 0, sizeof(globals));
+	globals.state = STATE_UNKNOWN;
 
 	if (switch_xml_config_parse_module_settings("alkcom.conf", reload, instructions) != SWITCH_STATUS_SUCCESS) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "Could not open alkcom.conf\n");
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CRIT, "ALKCOM: Could not open alkcom.conf\n");
 		return SWITCH_STATUS_FALSE;
 	}
 
 	return SWITCH_STATUS_SUCCESS;
 }
-#include "switch_stun.h"
 
-#define _switch_stun_packet_next_attribute(attribute, end) (attribute && (attribute = (switch_stun_packet_attribute_t *) (attribute->value + ntohs(attribute->length))) && ((void *)attribute < end) && ntohs(attribute->length) && ((void *)(attribute + ntohs(attribute->length)) < end))
-
-#define _switch_stun_attribute_padded_length(attribute) ((uint16_t)(ntohs(attribute->length) + (sizeof(uint32_t)-1)) & ~sizeof(uint32_t))
-
-//#define _switch_stun_packet_next_attribute(attribute, end) (attribute && (attribute = (switch_stun_packet_attribute_t *) (attribute->value +  _switch_stun_attribute_padded_length(attribute))) && ((void *)attribute < end) && ((void *)(attribute +  _switch_stun_attribute_padded_length(attribute)) < end))
-
-#define MAX_PEERS 128
+#define ALKCOM_API_USAGE "status/card_active[true|false]/reboot[true|false]"
 SWITCH_STANDARD_API(alkcom_function)
 {
-	switch_dial_handle_t *dh;
-	switch_dial_leg_list_t *ll;
-	switch_dial_leg_t *leg = NULL;
-	int timeout = 0;
-	char *peer_names[MAX_PEERS] = { 0 };
-	switch_event_t *peer_vars[MAX_PEERS] = { 0 };
-	int i;
-	switch_core_session_t *peer_session = NULL;
-	switch_call_cause_t cause;
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM FUNCTION: ip - %s\n", globals.floating_ip_addr);
+	int argc = 0;
+	char *argv[2] = {0};
+	char *mydata = NULL;
+	char *value = NULL;
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM FUNCTION: cmd - %s\n", cmd);
+
+	if (!zstr(cmd)) {
+		mydata = strdup(cmd);
+		switch_assert(mydata);
+		argc = switch_separate_string(mydata, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
+	}
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM FUNCTION: argc - '%d', argv0 - '%s',argv1 - '%s'\n", argc,
+					  argv[0], argv[1]);
+
+	if (argc < 1 || !argv[0]) { 
+		goto usage; 
+	}
 	
-	switch_dial_handle_create(&dh);
+	if (!strcasecmp(argv[0], "card_active")) {
+		if (!strcasecmp(argv[1], "true")) {
+			globals.is_available = SWITCH_TRUE;
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM FUNCTION: card available set to true\n");
+		} else if (!strcasecmp(argv[1], "false")) {
+			globals.is_available = SWITCH_FALSE;
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM FUNCTION: card available set to false\n");
+		} else {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM FUNCTION: argv1 did not match\n");
+			goto usage;
+		}
 
-
-	switch_dial_handle_add_global_var(dh, "ignore_early_media", "true");
-	switch_dial_handle_add_global_var_printf(dh, "coolness_count", "%d", 12);
-
-
-	//// SET TO 1 FOR AND LIST example or to 0 for OR LIST example
-#if 0
-	switch_dial_handle_add_leg_list(dh, &ll);
-
-	switch_dial_leg_list_add_leg(ll, &leg, "sofia/internal/foo1@bar1.com");
-	timeout += 10;
-	switch_dial_handle_add_leg_var_printf(leg, "leg_timeout", "%d", timeout);
-
-	switch_dial_leg_list_add_leg(ll, &leg, "sofia/internal/foo2@bar2.com");
-	timeout += 10;
-	switch_dial_handle_add_leg_var_printf(leg, "leg_timeout", "%d", timeout);
-
-	
-	switch_dial_leg_list_add_leg(ll, &leg, "sofia/internal/foo3@bar3.com");
-	timeout += 10;
-	switch_dial_handle_add_leg_var_printf(leg, "leg_timeout", "%d", timeout);
-
-
-	switch_dial_leg_list_add_leg(ll, &leg, "sofia/internal/3000@cantina.freeswitch.org");
-
-
-#else
-
-	switch_dial_handle_add_leg_list(dh, &ll); 
-	switch_dial_leg_list_add_leg(ll, &leg, "sofia/internal/foo1@bar1.com");
-	timeout += 10;
-	switch_dial_handle_add_leg_var_printf(leg, "leg_timeout", "%d", timeout);
-
-	switch_dial_handle_add_leg_list(dh, &ll); 
-	switch_dial_leg_list_add_leg(ll, &leg, "sofia/internal/foo2@bar2.com");
-	timeout += 10;
-	switch_dial_handle_add_leg_var_printf(leg, "leg_timeout", "%d", timeout);
-
-	switch_dial_handle_add_leg_list(dh, &ll); 
-	switch_dial_leg_list_add_leg(ll, &leg, "sofia/internal/foo3@bar3.com");
-	timeout += 10;
-	switch_dial_handle_add_leg_var_printf(leg, "leg_timeout", "%d", timeout);
-
-	
-	switch_dial_handle_add_leg_list(dh, &ll); 
-	switch_dial_leg_list_add_leg(ll, &leg, "sofia/internal/3000@cantina.freeswitch.org");
-#endif
-	
-
-	
-	/////// JUST DUMP SOME OF IT TO SEE FIRST 
-
-	switch_dial_handle_get_peers(dh, 0, peer_names, MAX_PEERS);
-	switch_dial_handle_get_vars(dh, 0, peer_vars, MAX_PEERS);
-
-
-
-	
-	for(i = 0; i < MAX_PEERS; i++) {
-		if (peer_names[i]) {
-			char *foo;
-			
-			printf("peer: [%s]\n", peer_names[i]);
-
-			if (peer_vars[i]) {
-				if (switch_event_serialize(peer_vars[i], &foo, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS) {
-					printf("%s\n", foo);
-				}
+	} else if (!strcasecmp(argv[0], "status")) {
+		stream->write_function(stream, "+OK\nStatus: %d", globals.state);
+		goto done;
+	} else if (!strcasecmp(argv[0], "reboot")) {
+		if (argc == 1) {
+			stream->write_function(stream, "+OK\nReboot: %s", globals.do_reboot ? "yes" : "no");
+			goto done;
+		} else {
+			if (!strcasecmp(argv[1], "true")) {
+				globals.do_reboot = SWITCH_TRUE;
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM FUNCTION: reboot set to true\n");
+			} else if (!strcasecmp(argv[1], "false")) {
+				globals.do_reboot = SWITCH_FALSE;
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM FUNCTION: reboot set to false\n");
+			} else {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM FUNCTION: argv1 did not match\n");
+				goto usage;
 			}
-			printf("\n\n");
 		}
 	}
-
-
-	switch_ivr_originate(NULL, &peer_session, &cause, NULL, 0, NULL, NULL, NULL, NULL, NULL, SOF_NONE, NULL, dh);
-
-	if (peer_session) {
-		switch_ivr_session_transfer(peer_session, "3500", "XML", NULL);
-		switch_core_session_rwunlock(peer_session);
+	else {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM FUNCTION: argv0 did not match\n");
+		goto usage;
 	}
-
 	
-	switch_dial_handle_destroy(&dh);
-	
+	stream->write_function(stream, "+OK\n");
+	goto done;
 
+usage:
+	stream->write_function(stream, "-ERR Usage: alkcom %s\n", ALKCOM_API_USAGE);
 
-		
+done:
+
+	switch_safe_free(mydata);
+
 	return SWITCH_STATUS_SUCCESS;
-}
-
-static void mycb(switch_core_session_t *session, switch_channel_callstate_t callstate, switch_device_record_t *drec)
-{
-	switch_channel_t *channel = switch_core_session_get_channel(session);
-
-	switch_log_printf(SWITCH_CHANNEL_CHANNEL_LOG(channel), SWITCH_LOG_CRIT,
-					  "%s device: %s\nState: %s Dev State: %s/%s Total:%u Offhook:%u Active:%u Held:%u Hungup:%u Dur: %u %s\n",
-					  switch_channel_get_name(channel),
-					  drec->device_id,
-					  switch_channel_callstate2str(callstate),
-					  switch_channel_device_state2str(drec->last_state),
-					  switch_channel_device_state2str(drec->state),
-					  drec->stats.total,
-					  drec->stats.offhook,
-					  drec->stats.active,
-					  drec->stats.held,
-					  drec->stats.hup,
-					  drec->active_stop ? (uint32_t)(drec->active_stop - drec->active_start) / 1000 : 0,
-					  switch_channel_test_flag(channel, CF_FINAL_DEVICE_LEG) ? "FINAL LEG" : "");
-
 }
 
 
@@ -255,9 +220,16 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_alkcom_load)
 
 	do_config(SWITCH_FALSE);
 
-	SWITCH_ADD_API(api_interface, "alkcom", "alkcom API", alkcom_function, "syntax");
+	SWITCH_ADD_API(api_interface, "alkcom", "alkcom API", alkcom_function, "alckom acitve=1|0|true|false");
+	switch_console_set_complete("add alkcom card_active true");
+	switch_console_set_complete("add alkcom card_active false");
+	switch_console_set_complete("add alkcom status");
+	switch_console_set_complete("add alkcom reboot");
+	switch_console_set_complete("add alkcom reboot true");
+	switch_console_set_complete("add alkcom reboot false");
 
-	switch_channel_bind_device_state_handler(mycb, NULL);
+
+	globals.is_running = SWITCH_TRUE;
 
 	/* indicate that the module should continue to be loaded */
 	return SWITCH_STATUS_SUCCESS;
@@ -269,25 +241,116 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_alkcom_load)
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_alkcom_shutdown)
 {
 	/* Cleanup dynamically allocated config settings */
-	switch_channel_unbind_device_state_handler(mycb);
+	globals.is_running = SWITCH_FALSE;
 	switch_xml_config_cleanup(instructions);
 	return SWITCH_STATUS_SUCCESS;
 }
 
+static switch_bool_t is_network_card_available() {
+	return globals.is_available; 
+}
 
-/*
-  If it exists, this is called in it's own thread when the module-load completes
-  If it returns anything but SWITCH_STATUS_TERM it will be called again automatically
-  Macro expands to: switch_status_t mod_alkcom_runtime()
+static void start_connections() {
+	// reload mod sofia -> sofia recover
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM: Sofia should start here\n");
+	
+	switch_stream_handle_t stream = {0};
+
+	SWITCH_STANDARD_STREAM(stream);
+
+	switch_api_execute("reload", "mod_sofia", NULL, &stream);
+	switch_api_execute("sofia", "recover", NULL, &stream);
+
+	switch_safe_free(stream.data);
+}
+
+static void restart_workstation() {
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+					  "ALKCOM: restart should happend here\n");
+	if (reboot()) 
+	{
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM: restart happening\n");
+	} else 
+	{
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM: could not restart workstation\n");
+		// kill switch ???
+		// kill sofia ???
+		// restart FS ???
+	};
+}
+
+static void check_switchover_state()
+{
+	//switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM FUNCTION: is card available - %d\n", globals.is_available);
+	switch (globals.state) {
+		case STATE_UNKNOWN: {
+			if (is_network_card_available()) { 
+				globals.state = STATE_PRIMARY;
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM: State changed from STATE_UNKNOWN to STATE_PRIMARY\n");
+				start_connections();
+			} else {
+				globals.state = STATE_SECONDARY;
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+								  "ALKCOM: State changed from STATE_UNKNOWN to STATE_SECONDARY\n");
+			}
+			break;
+		}
+		case STATE_PRIMARY: {
+			if (is_network_card_available()) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+								  "ALKCOM: State stays STATE_PRIMARY\n");
+			} else {
+				globals.state = STATE_SECONDARY;
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+								  "ALKCOM: State changed from STATE_PRIMARY to STATE_SECONDARY\n");
+				
+				if (globals.do_reboot) {
+					restart_workstation(); 
+				} else {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+									  "ALKCOM: Reboot is set to false\n");
+				}
+			}
+			break;
+		}
+		case STATE_SECONDARY: {
+			if (is_network_card_available()) {
+				globals.state = STATE_PRIMARY;
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+								  "ALKCOM: State changed from STATE_SECONDARY to STATE_PRIMARY\n");
+				start_connections();
+				
+			} else {
+				globals.state = STATE_SECONDARY;
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "ALKCOM: State stays STATE_SECONDARY\n");
+			}
+			break;
+		}
+		default: {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "ALKCOM: Unkown Value of state: %d\n", globals.state);
+			break;
+		}
+	}
+}
+
+//  If it exists, this is called in it's own thread when the module-load completes
+//  If it returns anything but SWITCH_STATUS_TERM it will be called again automatically
+//  Macro expands to: switch_status_t mod_alkcom_runtime()
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_alkcom_runtime)
 {
-	while(looping)
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "ALKCOM: Entered runtime\n");
+
+	while (globals.is_running)
 	{
-		switch_cond_next();
+		switch_sleep(5 * 1000000);
+		//switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Hello World from alkcom runtime\n");
+		check_switchover_state();
 	}
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "ALKCOM: Exit runtime\n");
+	//return SWITCH_STATUS_TERM;
 	return SWITCH_STATUS_TERM;
 }
-*/
+
 
 /* For Emacs:
  * Local Variables:
